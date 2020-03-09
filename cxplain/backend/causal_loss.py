@@ -19,6 +19,7 @@ from __future__ import print_function
 
 import tensorflow as tf
 from cxplain.backend.tf_math_interface import TensorflowInterface
+import tensorflow.keras.backend as K
 
 
 def safe_evaluate_custom_loss_function(loss_function, y_true, y_pred, math_ops):
@@ -82,7 +83,7 @@ def calculate_delta_errors(y_true, auxiliary_outputs, all_but_one_auxiliary_outp
     # NOTE: Without stop_gradient back-propagation would attempt to optimise the error_variance
     # instead of/in addition to the distance between attention weights and Granger-causal attributions,
     # which is not desired.
-    delta_errors = math_ops.stop_gradient(delta_errors)
+    delta_errors = tf.keras.backend.stop_gradient(delta_errors)
     return delta_errors
 
 
@@ -101,3 +102,35 @@ def causal_loss(y_true, y_pred, attention_weights, auxiliary_outputs, all_but_on
         attention_weights = math_ops.squeeze(attention_weights, axis=-1)
 
     return math_ops.mean(math_ops.kullback_leibler_divergence(delta_errors, attention_weights))
+
+
+class CausalLoss(tf.keras.losses.Loss):
+    def __init__(self,
+                 num_indices,
+                 loss_function,
+                 math_ops=TensorflowInterface):
+        super(CausalLoss, self).__init__()
+        self.num_indices = num_indices
+        self.loss_function = loss_function
+        self.math_ops = math_ops
+
+    def call(self, y_true, y_pred):
+
+        attention_weights, all_but_one_auxiliary_outputs, auxiliary_outputs = \
+                        tf.split(y_pred, [self.num_indices, self.num_indices, 1], 1)
+
+        all_but_one_auxiliary_outputs = tf.split(all_but_one_auxiliary_outputs, self.num_indices, 1)
+
+        delta_errors = calculate_delta_errors(y_true,
+                                              auxiliary_outputs,
+                                              all_but_one_auxiliary_outputs,
+                                              self.loss_function,
+                                              math_ops=self.math_ops)
+
+        # Ensure correct format.
+        attention_weights = self.math_ops.clip(attention_weights, self.math_ops.epsilon(), 1.0)
+
+        if len(attention_weights.shape) == 3:
+            attention_weights = self.math_ops.squeeze(attention_weights, axis=-1)
+
+        return self.math_ops.mean(self.math_ops.kullback_leibler_divergence(delta_errors, attention_weights))

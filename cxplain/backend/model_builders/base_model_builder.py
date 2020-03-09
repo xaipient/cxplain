@@ -24,11 +24,11 @@ import tensorflow.keras.backend as K
 from abc import ABCMeta, abstractmethod
 from tensorflow.python.keras.models import Model
 from cxplain.backend.validation import Validation
-from cxplain.backend.causal_loss import causal_loss
+from cxplain.backend.causal_loss import causal_loss, CausalLoss
 from cxplain.backend.masking.masking_util import MaskingUtil
 from tensorflow.python.keras.backend import resize_images, resize_volumes
 from tensorflow.python.keras.callbacks import ModelCheckpoint, EarlyStopping
-from tensorflow.python.keras.layers import Input, Dense, Flatten, Lambda, Reshape
+from tensorflow.python.keras.layers import Input, Dense, Flatten, Lambda, Reshape, Concatenate
 
 
 @six.add_metaclass(ABCMeta)
@@ -87,12 +87,10 @@ class BaseModelBuilder(object):
         else:
             all_but_one_auxiliary_outputs = all_but_one_auxiliary_outputs_input
 
-        causal_loss_fun = partial(causal_loss,
-                                  attention_weights=last_layer,
-                                  auxiliary_outputs=all_auxiliary_outputs,
-                                  all_but_one_auxiliary_outputs=all_but_one_auxiliary_outputs,
-                                  loss_function=loss)
-        causal_loss_fun.__name__ = "causal_loss"
+        all_but_one_auxiliary_outputs = Concatenate()(all_but_one_auxiliary_outputs)
+
+        causal_loss_fun = CausalLoss(num_indices=num_indices,
+                                     loss_function=loss)
 
         if downsampling_factor != 1:
             last_layer = Reshape(tuple(steps) + (1,))(last_layer)
@@ -127,16 +125,14 @@ class BaseModelBuilder(object):
             # Re-normalise to sum = 1 after resizing (sum = __downsampling_factor__ after resizing).
             last_layer = Lambda(lambda x: x / float(downsampling_factor))(last_layer)
 
-        # We must connect all inputs to the output to bypass a bug in model saving in tf < 1.15.0rc0.
-        # For easier handling when calling .fit(), we transform all outputs to be the same shape.
-        # See https://github.com/tensorflow/tensorflow/pull/30244
-        all_but_one_same_shape_output_layer = Lambda(lambda x: x[:, 0, :])(all_but_one_auxiliary_outputs_input)
+        final_layer = Concatenate()([last_layer, all_but_one_auxiliary_outputs, all_auxiliary_outputs])
 
         model = Model(inputs=[input_layer,
                               all_auxiliary_outputs,
                               all_but_one_auxiliary_outputs_input],
-                      outputs=[last_layer, all_auxiliary_outputs, all_but_one_same_shape_output_layer])
-        model = self.compile_model(model, main_losses=[causal_loss_fun, "mse", "mse"], loss_weights=[1.0]*3,
+                      outputs=final_layer)
+
+        model = self.compile_model(model, main_losses=causal_loss_fun,
                                    learning_rate=self.learning_rate, optimizer=self.optimizer)
 
         prediction_model = Model(input_layer, last_layer)
@@ -147,11 +143,11 @@ class BaseModelBuilder(object):
         losses = main_losses
 
         if optimizer == "rmsprop":
-            opt = tf.compat.v1.train.RMSPropOptimizer(learning_rate=learning_rate)
+            opt = tf.keras.optimizers.RMSprop(learning_rate=learning_rate)
         elif optimizer == "sgd":
-            opt = tf.compat.v1.train.MomentumOptimizer(learning_rate=learning_rate, use_nesterov=True, momentum=0.9)
+            opt = tf.keras.optimizers.SGD(learning_rate=learning_rate, nesterov=True, momentum=0.9)
         else:
-            opt = tf.compat.v1.train.AdamOptimizer(learning_rate=learning_rate)
+            opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
 
         model.compile(loss=losses,
                       loss_weights=loss_weights,
@@ -175,7 +171,7 @@ class BaseModelBuilder(object):
                             # We must feed two extra outputs due to a bug in TensorFlow < 1.15.0rc0 that would not
                             # allow saving models without connecting all inputs to output nodes.
                             # See https://github.com/tensorflow/tensorflow/pull/30244
-                            y=[y, y, y],
+                            y=y,
                             batch_size=self.batch_size,
                             shuffle=self.shuffle,
                             validation_split=self.validation_fraction,
@@ -192,7 +188,7 @@ class BaseModelBuilder(object):
         # allow saving models without connecting all inputs to output nodes.
         # See https://github.com/tensorflow/tensorflow/pull/30244
         return_value = model.evaluate(x=X,
-                                      y=[y, y, y],
+                                      y=y,
                                       sample_weight=sample_weight,
                                       verbose=self.verbose)
         return return_value
